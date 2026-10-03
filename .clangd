@@ -1,0 +1,4 @@
+CompileFlags:
+  CompilationDatabase: build
+  Remove: [-m*, -f*]
+  Add: ['-resource-dir=C:/Espressif/tools/esp-clang/esp-21.1.3_20260408/esp-clang/lib/clang/21']

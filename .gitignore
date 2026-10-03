@@ -1,0 +1,19 @@
+# Saida da compilacao (gerada pelo idf.py)
+build/
+
+# Backup automatico do menuconfig (o sdkconfig deve ser versionado)
+sdkconfig.old
+
+# Componentes baixados pelo Component Manager
+managed_components/
+
+# Cache do clangd
+.cache/
+
+# Configuracoes locais da IDE (Eclipse / Espressif IDE)
+.settings/
+
+# Arquivos do sistema
+Thumbs.db
+desktop.ini
+.DS_Store
