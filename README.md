@@ -5,12 +5,12 @@ sentenças NMEA e mostra **data/hora, latitude, longitude, altitude e número de
 no monitor serial e no display OLED da placa.
 
 ```
-I (747270) GPS: 03/10/2026 16:10:53 | Lat: -26.229174 | Lon: -52.672226 | Alt: 727.9 m
+I (747270) GPS: 03/10/2026 16:10:53.4 | Lat: -26.229174 | Lon: -52.672226 | Alt: 727.9 m
 ```
 
 ```
 ┌─────────────────────┐
-│03/10/2026 16:10:53  │
+│03/10/2026 16:10:53.4│
 │─────────────────────│
 │Lat: -26.229174      │
 │Lon: -52.672226      │
@@ -33,7 +33,7 @@ I (747270) GPS: 03/10/2026 16:10:53 | Lat: -26.229174 | Lon: -52.672226 | Alt: 7
 | NEO-6M | Heltec V3 | Observação |
 |---|---|---|
 | TX | **GPIO4** | RX da UART1 do ESP32 |
-| RX | **GPIO5** | TX da UART1 do ESP32 (opcional, só para configurar o GPS) |
+| RX | **GPIO5** | TX da UART1 do ESP32 (necessário para configurar 38400 baud / 5 Hz) |
 | VCC | 3V3 ou Vext | Vext é ligado pelo firmware (GPIO36 em LOW) |
 | GND | GND | GND precisa ser comum |
 
@@ -57,6 +57,15 @@ NEO-6M --UART1 9600--> gps_task --> nmea_parse --> gps_data_t --> gps_print --> 
    - Liga o **Vext** (GPIO36 em LOW), que alimenta o OLED e o pino Vext.
    - Inicializa o **display OLED** (`oled_init`). Se falhar, registra o erro e segue sem display.
    - Configura a **UART1** em 9600 baud, 8N1, nos pinos 4 (RX) e 5 (TX).
+   - **Configura o GPS (`gps_config`)** com comandos binários **UBX** da u-blox:
+     - `CFG-PRT`: muda o GPS para **38400 baud**. O comando é enviado em 9600 e em 38400,
+       porque o GPS pode já estar configurado se só o ESP32 reiniciou.
+     - `CFG-MSG`: desliga as sentenças GLL, GSA, GSV e VTG (só RMC e GGA são usadas).
+     - `CFG-RATE`: define a taxa de atualização de **5 Hz** (uma medição a cada 200 ms).
+     - Cada comando espera a confirmação (`ACK-ACK`). Se o GPS não responder, por exemplo
+       com o fio GPIO5 → RX solto, o firmware volta para 9600 baud / 1 Hz e mostra um aviso.
+     - A configuração fica na RAM do GPS e se perde quando ele é desligado, por isso é
+       refeita a cada boot.
    - Cria a tarefa `gps_task`.
 
 2. **Leitura (`gps_task`)**
@@ -69,7 +78,8 @@ NEO-6M --UART1 9600--> gps_task --> nmea_parse --> gps_data_t --> gps_print --> 
    - Aceita os prefixos `$GP` e `$GN`.
    - **`RMC`**: status (`A` = posição válida), latitude, longitude, hora e data.
    - **`GGA`**: número de satélites e altitude. Como a `GGA` chega depois da `RMC` em cada
-     ciclo, a impressão acontece aqui, uma vez por segundo.
+     ciclo, a impressão acontece aqui, 5 vezes por segundo.
+   - Guarda também a fração do segundo (`ms`), exibida como décimos (`16:10:53.4`).
    - Converte as coordenadas de `ggmm.mmmm` para **graus decimais** (sul e oeste ficam negativos).
    - Converte hora e data para **Unix timestamp** (UTC).
 
@@ -87,6 +97,7 @@ Os dados mais recentes ficam na variável global `gps` (`gps_data_t`):
 | `alt` | `float` | metros acima do nível do mar |
 | `sats` | `int` | satélites usados no cálculo |
 | `timestamp` | `time_t` | Unix time em UTC |
+| `ms` | `int` | milissegundos dentro do segundo (0, 200, 400, 600, 800) |
 
 ## Estrutura do projeto
 
@@ -105,7 +116,9 @@ No topo de [main/main.c](main/main.c):
 | Define | Padrão | Função |
 |---|---|---|
 | `GPS_RX_PIN` / `GPS_TX_PIN` | 4 / 5 | Pinos da UART do GPS |
-| `GPS_BAUD` | 9600 | Velocidade padrão do NEO-6M |
+| `GPS_BAUD_PADRAO` | 9600 | Velocidade de fábrica do NEO-6M |
+| `GPS_BAUD` | 38400 | Velocidade usada depois da configuração |
+| `GPS_TAXA_HZ` | 5 | Posições por segundo (1 a 5 no NEO-6M) |
 | `FUSO_HORARIO` | -3 | Horas em relação ao UTC (Brasília) |
 | `MOSTRAR_NMEA` | 0 | `1` imprime também as sentenças NMEA brutas |
 
@@ -132,6 +145,7 @@ Para sair do monitor, use `Ctrl + ]`.
 |---|---|
 | Só aparece `Aguardando posicao... (satelites: 0)` | O GPS ainda não tem sinal. Use a antena com o céu aberto e espere de 1 a 5 min na primeira vez. O LED do NEO-6M pisca quando há posição. |
 | Nenhuma linha do GPS | Confira se o TX do GPS está no GPIO4, o GND comum e a alimentação. Use `MOSTRAR_NMEA 1` para ver os dados brutos. |
+| `GPS nao confirmou a configuracao` | O GPS não recebeu os comandos UBX. Confira o fio GPIO5 → RX do GPS. O firmware continua funcionando a 9600 baud / 1 Hz. |
 | Posição "passeando" dezenas de metros parada | Sinal fraco ou poucos satélites (comum em ambiente fechado). Ao ar livre o erro típico é de 2 a 5 m. |
 | `Could not open COM.. Acesso negado` | A porta está aberta por outro programa (monitor serial, Arduino IDE etc.). Feche-o e grave de novo. |
 | `ClearCommError failed` no monitor | O USB desconectou (cabo, mau contato ou queda de alimentação). Reconecte e reabra o monitor. |

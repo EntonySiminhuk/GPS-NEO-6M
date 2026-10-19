@@ -14,8 +14,10 @@ static const char *TAG = "GPS";
 
 #define GPS_UART    UART_NUM_1
 #define GPS_RX_PIN  4    // ligado ao TX do GPS
-#define GPS_TX_PIN  5    // ligado ao RX do GPS
-#define GPS_BAUD    9600 // padrao do NEO-6M
+#define GPS_TX_PIN  5    // ligado ao RX do GPS (necessario para configurar o GPS)
+#define GPS_BAUD_PADRAO 9600   // velocidade de fabrica do NEO-6M
+#define GPS_BAUD    38400      // velocidade usada depois da configuracao
+#define GPS_TAXA_HZ 5          // posicoes por segundo (NEO-6M: 1 a 5)
 #define BUF_SIZE    1024
 
 // Heltec WiFi LoRa 32 V3: Vext (GPIO36) alimenta o pino 3V3 "Vext" e o OLED.
@@ -35,6 +37,7 @@ typedef struct {
     float  alt;         // altitude em metros (nivel do mar)
     int    sats;        // satelites usados no calculo
     time_t timestamp;   // Unix time (segundos desde 1970, UTC)
+    int    ms;          // milissegundos dentro do segundo (0, 200, 400...)
 } gps_data_t;
 
 static gps_data_t gps;
@@ -55,9 +58,9 @@ static void gps_print(const gps_data_t *g)
     if (oled_ok) {
         oled_clear();
         if (g->timestamp) {
-            oled_printf(0, 0, "%02d/%02d/%04d %02d:%02d:%02d",
+            oled_printf(0, 0, "%02d/%02d/%04d %02d:%02d:%02d.%d",
                         t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
-                        t.tm_hour, t.tm_min, t.tm_sec);
+                        t.tm_hour, t.tm_min, t.tm_sec, g->ms / 100);
         } else {
             oled_text(0, 0, "GPS NEO-6M");
         }
@@ -78,9 +81,9 @@ static void gps_print(const gps_data_t *g)
         return;
     }
 
-    ESP_LOGI(TAG, "%02d/%02d/%04d %02d:%02d:%02d | Lat: %.6f | Lon: %.6f | Alt: %.1f m",
+    ESP_LOGI(TAG, "%02d/%02d/%04d %02d:%02d:%02d.%d | Lat: %.6f | Lon: %.6f | Alt: %.1f m",
              t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
-             t.tm_hour, t.tm_min, t.tm_sec,
+             t.tm_hour, t.tm_min, t.tm_sec, g->ms / 100,
              g->lat, g->lon, g->alt);
 }
 
@@ -161,6 +164,8 @@ static void nmea_parse(char *linha)
             gps.lon = nmea_coord(f[5], f[6]);
         }
         gps.timestamp = nmea_time(f[1], f[9]);
+        // fracao do segundo: "183535.20" -> 200 ms
+        gps.ms = (strlen(f[1]) > 6) ? (int)(atof(f[1] + 6) * 1000 + 0.5) : 0;
     }
     // $GPGGA,hora,lat,N/S,lon,E/W,qualidade,sats,hdop,alt,M,...
     // GGA chega depois do RMC em cada ciclo: imprime aqui
@@ -169,6 +174,107 @@ static void nmea_parse(char *linha)
         gps.alt  = atof(f[9]);
         gps_print(&gps);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Configuracao do GPS (protocolo binario UBX da u-blox)
+// ---------------------------------------------------------------------------
+
+// Pacote UBX: B5 62 | classe | id | tamanho (2 bytes, LE) | payload | CK_A CK_B
+static void ubx_send(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len)
+{
+    uint8_t hdr[6] = {0xB5, 0x62, cls, id, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8)};
+    uint8_t ck[2] = {0, 0};
+
+    // Checksum Fletcher de 8 bits, da classe ate o fim do payload
+    for (int i = 2; i < 6; i++) {
+        ck[0] += hdr[i];
+        ck[1] += ck[0];
+    }
+    for (int i = 0; i < len; i++) {
+        ck[0] += payload[i];
+        ck[1] += ck[0];
+    }
+
+    uart_write_bytes(GPS_UART, hdr, sizeof(hdr));
+    uart_write_bytes(GPS_UART, payload, len);
+    uart_write_bytes(GPS_UART, ck, sizeof(ck));
+    uart_wait_tx_done(GPS_UART, pdMS_TO_TICKS(100));
+}
+
+// Espera o UBX-ACK-ACK (B5 62 05 01 02 00 cls id) do comando enviado
+static bool ubx_wait_ack(uint8_t cls, uint8_t id)
+{
+    const uint8_t ack[] = {0xB5, 0x62, 0x05, 0x01, 0x02, 0x00, cls, id};
+    size_t match = 0;
+    TickType_t inicio = xTaskGetTickCount();
+    uint8_t b;
+
+    while (xTaskGetTickCount() - inicio < pdMS_TO_TICKS(500)) {
+        if (uart_read_bytes(GPS_UART, &b, 1, pdMS_TO_TICKS(10)) != 1) {
+            continue;
+        }
+        if (b == ack[match]) {
+            if (++match == sizeof(ack)) {
+                return true;
+            }
+        } else {
+            match = (b == ack[0]) ? 1 : 0;
+        }
+    }
+    return false;
+}
+
+static bool ubx_cmd(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len)
+{
+    ubx_send(cls, id, payload, len);
+    return ubx_wait_ack(cls, id);
+}
+
+// Muda a velocidade, desliga sentencas nao usadas e ajusta a taxa de
+// atualizacao. A configuracao fica na RAM do GPS: ao perder a alimentacao
+// ele volta ao padrao (9600 baud, 1 Hz), por isso e refeita a cada boot.
+static bool gps_config(void)
+{
+    // UBX-CFG-PRT: UART1 do GPS em GPS_BAUD, 8N1, entrada UBX+NMEA, saida UBX+NMEA
+    const uint8_t cfg_prt[20] = {
+        0x01, 0x00, 0x00, 0x00,                          // porta 1, reservado, txReady
+        0xD0, 0x08, 0x00, 0x00,                          // modo 8N1
+        (uint8_t)(GPS_BAUD & 0xFF), (uint8_t)((GPS_BAUD >> 8) & 0xFF),
+        (uint8_t)((GPS_BAUD >> 16) & 0xFF), (uint8_t)(GPS_BAUD >> 24),
+        0x03, 0x00,                                      // protocolos de entrada
+        0x03, 0x00,                                      // protocolos de saida
+        0x00, 0x00, 0x00, 0x00,                          // flags, reservado
+    };
+
+    // O GPS pode estar em 9600 (acabou de ligar) ou ja em GPS_BAUD (so o
+    // ESP32 reiniciou): envia o comando nas duas velocidades.
+    const uint32_t bauds[] = {GPS_BAUD_PADRAO, GPS_BAUD};
+    for (size_t i = 0; i < sizeof(bauds) / sizeof(bauds[0]); i++) {
+        uart_set_baudrate(GPS_UART, bauds[i]);
+        ubx_send(0x06, 0x00, cfg_prt, sizeof(cfg_prt));
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    uart_set_baudrate(GPS_UART, GPS_BAUD);
+    uart_flush_input(GPS_UART);
+
+    // UBX-CFG-MSG: desliga GLL, GSA, GSV e VTG (so RMC e GGA sao usadas)
+    const uint8_t desligar[] = {0x01, 0x02, 0x03, 0x05};
+    for (size_t i = 0; i < sizeof(desligar); i++) {
+        const uint8_t cfg_msg[3] = {0xF0, desligar[i], 0x00};  // classe NMEA, id, taxa 0
+        if (!ubx_cmd(0x06, 0x01, cfg_msg, sizeof(cfg_msg))) {
+            return false;
+        }
+    }
+
+    // UBX-CFG-RATE: intervalo entre medicoes em ms, 1 navegacao por medicao, hora GPS
+    const uint16_t periodo = 1000 / GPS_TAXA_HZ;
+    const uint8_t cfg_rate[6] = {
+        (uint8_t)(periodo & 0xFF), (uint8_t)(periodo >> 8),
+        0x01, 0x00,
+        0x01, 0x00,
+    };
+    return ubx_cmd(0x06, 0x08, cfg_rate, sizeof(cfg_rate));
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +298,7 @@ static void gps_task(void *arg)
         int len = uart_read_bytes(GPS_UART, rx, sizeof(rx), pdMS_TO_TICKS(100));
         for (int i = 0; i < len; i++) {
             char c = (char)rx[i];
-            if (c == '$') {           // inicio de sentenca NMEA
+            if (c == '$') {// inicio de sentenca NMEA
                 pos = 0;
             }
             if (c == '\r' || c == '\n') {
@@ -228,7 +334,7 @@ void app_main(void)
     }
 
     const uart_config_t cfg = {
-        .baud_rate  = GPS_BAUD,
+        .baud_rate  = GPS_BAUD_PADRAO,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
@@ -241,8 +347,16 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_set_pin(GPS_UART, GPS_TX_PIN, GPS_RX_PIN,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    ESP_LOGI(TAG, "UART%d pronta (RX=%d, TX=%d, %d baud)",
-             GPS_UART, GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD);
+    if (gps_config()) {
+        ESP_LOGI(TAG, "GPS configurado: UART%d (RX=%d, TX=%d), %d baud, %d Hz",
+                 GPS_UART, GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD, GPS_TAXA_HZ);
+    } else {
+        // Sem resposta (ex.: fio GPIO5 -> RX do GPS desligado): volta ao padrao
+        uart_set_baudrate(GPS_UART, GPS_BAUD_PADRAO);
+        ESP_LOGW(TAG, "GPS nao confirmou a configuracao (verifique GPIO%d -> RX do GPS). "
+                      "Usando o padrao: %d baud, 1 Hz",
+                 GPS_TX_PIN, GPS_BAUD_PADRAO);
+    }
 
     xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
 }
