@@ -99,13 +99,54 @@ Os dados mais recentes ficam na variável global `gps` (`gps_data_t`):
 | `timestamp` | `time_t` | Unix time em UTC |
 | `ms` | `int` | milissegundos dentro do segundo (0, 200, 400, 600, 800) |
 
+## Transmissão LoRa
+
+O mesmo firmware funciona em dois modos, escolhidos por `MODO_RECEPTOR` em [main/main.c](main/main.c):
+
+```
+ Placa 1: MODO_RECEPTOR 0                         Placa 2: MODO_RECEPTOR 1
+ GPS -> gps_task -> gps_ultimo -> lora_tx_task ~~~ 915 MHz ~~~> lora_rx_task -> terminal + OLED
+                                  (a cada 5 s)                  (RSSI, SNR, perdidos)
+```
+
+- **Transmissor:** a `lora_tx_task` acorda a cada `LORA_INTERVALO_MS`, copia a última leitura
+  completa (`gps_ultimo`, protegida por uma seção crítica do FreeRTOS), monta um `pacote_t` e envia.
+  O display mostra `LoRa: #N enviado` na última linha.
+- **Receptor:** a `lora_rx_task` deixa o rádio em recepção contínua, valida o pacote (tamanho e versão),
+  decodifica e mostra a posição, o RSSI, o SNR e os pacotes perdidos (saltos no contador).
+
+### Formato do pacote (21 bytes, binário, little-endian)
+
+| Bytes | Campo | Tipo | Conteúdo |
+|---|---|---|---|
+| 0 | `versao` | `uint8` | formato do pacote (1) |
+| 1 | `flags` | `uint8` | bit 0 = posição válida |
+| 2–3 | `contador` | `uint16` | número sequencial |
+| 4–7 | `timestamp` | `uint32` | Unix time UTC |
+| 8–11 | `lat` | `int32` | graus × 10⁷ |
+| 12–15 | `lon` | `int32` | graus × 10⁷ |
+| 16–19 | `alt` | `int32` | decímetros |
+| 20 | `sats` | `uint8` | satélites |
+
+### Rádio (SX1262)
+
+O driver em [main/lora.c](main/lora.c) conversa com o SX1262 por SPI e configura:
+TCXO de 1,8 V pelo DIO3, chave de antena pelo DIO2, regulador DC-DC, modo LoRa,
+915 MHz, SF9, 125 kHz, CR 4/5, CRC ligado e cabeçalho explícito.
+Com esses parâmetros, cada pacote ocupa o ar por **~185 ms**.
+
+Pinos internos usados: NSS 8, SCK 9, MOSI 10, MISO 11, RST 12, BUSY 13, DIO1 14.
+
+> **Nunca transmita sem a antena conectada**: a potência refletida pode danificar o SX1262.
+
 ## Estrutura do projeto
 
 | Arquivo | Conteúdo |
 |---|---|
-| [main/main.c](main/main.c) | UART, parser NMEA, formatação da saída e `app_main` |
+| [main/main.c](main/main.c) | UART, configuração UBX, parser NMEA, saída, tarefas LoRa TX/RX e `app_main` |
 | [main/oled.c](main/oled.c) / [main/oled.h](main/oled.h) | Driver do SSD1306 por I2C com fonte 5x7 (21 colunas x 8 linhas) |
-| [main/CMakeLists.txt](main/CMakeLists.txt) | Componentes usados (UART, GPIO, I2C) e avisos tratados como erro (`-Wall -Wextra -Werror`) |
+| [main/lora.c](main/lora.c) / [main/lora.h](main/lora.h) | Driver do SX1262 por SPI e parâmetros do rádio |
+| [main/CMakeLists.txt](main/CMakeLists.txt) | Componentes usados (UART, GPIO, I2C, SPI) e avisos tratados como erro (`-Wall -Wextra -Werror`) |
 | [CMakeLists.txt](CMakeLists.txt) | Projeto com `MINIMAL_BUILD`: compila só os componentes necessários |
 | [.clangd](.clangd) | Configuração do analisador do editor (veja abaixo) |
 
@@ -121,6 +162,18 @@ No topo de [main/main.c](main/main.c):
 | `GPS_TAXA_HZ` | 5 | Posições por segundo (1 a 5 no NEO-6M) |
 | `FUSO_HORARIO` | -3 | Horas em relação ao UTC (Brasília) |
 | `MOSTRAR_NMEA` | 0 | `1` imprime também as sentenças NMEA brutas |
+| `MODO_RECEPTOR` | 0 | `0` = transmissor com GPS, `1` = receptor LoRa |
+| `LORA_INTERVALO_MS` | 5000 | Intervalo entre transmissões |
+
+Em [main/lora.h](main/lora.h) (precisam ser **iguais** no transmissor e no receptor):
+
+| Define | Padrão | Função |
+|---|---|---|
+| `LORA_FREQ_HZ` | 915000000 | Frequência (Brasil: 902–907,5 e 915–928 MHz) |
+| `LORA_SF` | 9 | Spreading factor 7–12: maior = mais alcance e mais tempo no ar |
+| `LORA_BW` | 0x04 (125 kHz) | Largura de banda |
+| `LORA_CR` | 0x01 (4/5) | Coding rate |
+| `LORA_TX_DBM` | 14 | Potência de transmissão (−9 a 22 dBm) |
 
 Para mudar **o que aparece no terminal ou no display**, edite a função `gps_print()`.
 No display, use `oled_printf(coluna, linha, ...)` (coluna 0–20, linha 0–7) entre
@@ -150,6 +203,9 @@ Para sair do monitor, use `Ctrl + ]`.
 | `Could not open COM.. Acesso negado` | A porta está aberta por outro programa (monitor serial, Arduino IDE etc.). Feche-o e grave de novo. |
 | `ClearCommError failed` no monitor | O USB desconectou (cabo, mau contato ou queda de alimentação). Reconecte e reabra o monitor. |
 | `Falha ao iniciar o display` | O I2C não encontrou o OLED. Confira se a placa é a V3 (pinos 17/18/21). |
+| `Falha ao iniciar o radio: ESP_ERR_NOT_FOUND` | O SX1262 não respondeu pelo SPI. Confira se a placa é a V3. |
+| Receptor não recebe nada | Os parâmetros de `lora.h` precisam ser iguais nas duas placas, e as duas precisam de antena. Teste primeiro com as placas a poucos metros. |
+| `Pacote corrompido (erro de CRC)` frequente | Sinal no limite do alcance ou interferência. Aumente `LORA_SF` ou `LORA_TX_DBM`, ou melhore a posição das antenas. |
 | Aviso de Unicode do `idf.py` | Só afeta o terminal do Windows. Ative "UTF-8 Beta" nas configurações regionais ou defina `PYTHONUTF8=1`. |
 | Editor acusa `stddef.h file not found` | O pacote `esp-clangd` vem sem os headers internos. O [.clangd](.clangd) aponta `-resource-dir` para o `esp-clang`; ajuste a versão no caminho se atualizar as ferramentas. |
 
@@ -157,8 +213,7 @@ Para sair do monitor, use `Ctrl + ]`.
 
 - Gravar os pontos em CSV/GPX para visualizar o trajeto em um mapa.
 - Filtrar leituras ruins (poucos satélites ou HDOP alto).
-- Enviar a posição pelo **LoRa** (915 MHz) em um pacote binário compacto para uma segunda placa
-  e mostrar em tempo real (Traccar, Node-RED etc.).
+- No receptor, repassar os pacotes por Wi-Fi para um mapa em tempo real (Traccar, Node-RED etc.).
 
 ## Licença
 
