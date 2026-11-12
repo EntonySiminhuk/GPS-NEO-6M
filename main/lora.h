@@ -1,11 +1,12 @@
-33433434#pragma once
+#pragma once
 
 #include <stdint.h>
 #include <stddef.h>
 #include "esp_err.h"
 
 // Radio SX1262 da Heltec WiFi LoRa 32 V3 (LoRa ponto a ponto, sem LoRaWAN).
-// Transmissor e receptor precisam usar os MESMOS parametros abaixo.
+// Este projeto so TRANSMITE. O receptor (projeto separado) precisa usar
+// os MESMOS parametros abaixo.
 
 #define LORA_FREQ_HZ    915000000  // Brasil (Anatel): 902-907,5 e 915-928 MHz
 #define LORA_SF         9          // spreading factor 7..12 (maior = mais alcance, mais lento)
@@ -18,10 +19,3 @@ esp_err_t lora_init(void);
 
 // Transmite e espera o fim do envio (bloqueia por ~200 ms com SF9)
 esp_err_t lora_send(const uint8_t *data, size_t len);
-
-// Coloca o radio em recepcao continua
-esp_err_t lora_start_rx(void);
-
-// Espera um pacote por ate timeout_ms.
-// Retorna o tamanho recebido, 0 se nada chegou ou -1 se o pacote veio corrompido.
-int lora_receive(uint8_t *buf, size_t max, int *rssi, float *snr, uint32_t timeout_ms);

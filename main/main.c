@@ -10,13 +10,10 @@
 #include "freertos/task.h"
 #include "oled.h"
 #include "lora.h"
+#include "gps_filtro.h"
 
 static const char *TAG = "GPS";
 static const char *TAG_LORA = "LORA";
-
-// 0 = TRANSMISSOR (placa com GPS: le a posicao e envia pelo LoRa)
-// 1 = RECEPTOR    (segunda placa: recebe os pacotes e mostra na tela/terminal)
-#define MODO_RECEPTOR       0
 
 // Intervalo entre transmissoes LoRa
 #define LORA_INTERVALO_MS   5000
@@ -26,7 +23,7 @@ static const char *TAG_LORA = "LORA";
 #define GPS_TX_PIN  5    // ligado ao RX do GPS (necessario para configurar o GPS)
 #define GPS_BAUD_PADRAO 9600   // velocidade de fabrica do NEO-6M
 #define GPS_BAUD    38400      // velocidade usada depois da configuracao
-#define GPS_TAXA_HZ 1          // posicoes por segundo (NEO-6M: 1 a 5)
+#define GPS_TAXA_HZ 5          // posicoes por segundo desejadas (NEO-6M: 1 a 5)
 #define BUF_SIZE    1024
 
 // Heltec WiFi LoRa 32 V3: Vext (GPIO36) alimenta o pino 3V3 "Vext" e o OLED.
@@ -39,19 +36,40 @@ static const char *TAG_LORA = "LORA";
 // 1 = mostra tambem as sentencas NMEA brutas (para depuracao)
 #define MOSTRAR_NMEA   0
 
-typedef struct {
-    bool   valido;      // true quando o GPS tem posicao (fix)
-    double lat;         // graus decimais (sul negativo)
-    double lon;         // graus decimais (oeste negativo)
-    float  alt;         // altitude em metros (nivel do mar)
-    int    sats;        // satelites usados no calculo
-    time_t timestamp;   // Unix time (segundos desde 1970, UTC)
-    int    ms;          // milissegundos dentro do segundo (0, 200, 400...)
-} gps_data_t;
+// 1 = imprime TODAS as leituras (5 Hz) em linhas "CSV,..." para analise no PC.
+// Capture o monitor serial em arquivo e filtre as linhas que comecam com "CSV,".
+#define SAIDA_CSV      0
 
-static gps_data_t gps;          // usado so pela gps_task, enquanto monta os dados
-static gps_data_t gps_ultimo;   // copia completa mais recente, lida por outras tasks
+// Modelo dinamico do filtro interno do GPS (UBX-CFG-NAV5):
+// 0 portatil, 2 parado, 3 pedestre, 4 automotivo, 5 maritimo,
+// 6 aereo < 1g, 7 aereo < 2g, 8 aereo < 4g
+#define GPS_MODELO_DINAMICO 6
+
+// Sentencas que formam uma epoca (uma medicao completa)
+#define SENT_RMC  (1 << 0)
+#define SENT_GGA  (1 << 1)
+#define SENT_GSA  (1 << 2)
+#define SENT_GST  (1 << 3)
+
+// Epoca publicada para as outras tasks
+typedef struct {
+    gps_leitura_t l;
+    gps_motivo_t  motivo;  // GPS_OK = aprovada pelo filtro
+    TickType_t    tick;    // instante em que foi publicada
+} gps_estado_t;
+
+static gps_leitura_t gps;            // epoca sendo montada (so a gps_task usa)
+static gps_validador_t validador;    // estado da camada 1 (so a gps_task usa)
+static gps_estado_t gps_ultimo;      // ultima epoca completa, aprovada ou nao
+static gps_estado_t gps_aceito;      // ultima epoca aprovada
+static bool gps_tem_aceito;
 static portMUX_TYPE gps_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Montagem da epoca: RMC, GGA e GST trazem a hora; a GSA nao
+static uint8_t epoca_esperadas = SENT_RMC | SENT_GGA | SENT_GSA;  // GST entra se o GPS aceitar
+static uint8_t epoca_recebidas;
+static bool epoca_publicada;
+static char epoca_hora[16];
 
 // Pacote enviado pelo LoRa: 21 bytes em binario (em texto seriam ~70)
 typedef struct __attribute__((packed)) {
@@ -77,12 +95,39 @@ static bool lora_erro;
 // FORMATO DE SAIDA: altere esta funcao para mudar o que aparece no
 // terminal e no display (21 colunas x 8 linhas)
 // ---------------------------------------------------------------------------
-static void gps_print(const gps_data_t *g)
+static const char *fix_str(int fix)
 {
+    switch (fix) {
+    case 3:  return "3D";
+    case 2:  return "2D";
+    case 1:  return "--";
+    default: return "?";
+    }
+}
+
+// Valor opcional (negativo = desconhecido) como texto: "1.2" ou "--"
+static const char *opcional(char *buf, size_t n, const char *fmt, float v)
+{
+    if (v < 0) {
+        return "--";
+    }
+    snprintf(buf, n, fmt, v);
+    return buf;
+}
+
+static void gps_print(const gps_estado_t *e)
+{
+    const gps_leitura_t *g = &e->l;
+    const bool aceito = (e->motivo == GPS_OK);
+
     // Converte o timestamp UTC para o horario local
     time_t local = g->timestamp + FUSO_HORARIO * 3600;
     struct tm t;
     gmtime_r(&local, &t);
+
+    char buf_hdop[8], buf_erro[8];
+    const char *hdop = opcional(buf_hdop, sizeof(buf_hdop), "%.1f", g->hdop);
+    const char *erro = opcional(buf_erro, sizeof(buf_erro), "%.1f m", gps_erro_horizontal(g));
 
     if (oled_ok) {
         oled_clear();
@@ -94,13 +139,20 @@ static void gps_print(const gps_data_t *g)
             oled_text(0, 0, "GPS NEO-6M");
         }
         oled_hline(1);
-        if (g->valido) {
+        if (aceito) {
             oled_printf(0, 2, "Lat: %.6f", g->lat);
             oled_printf(0, 3, "Lon: %.6f", g->lon);
             oled_printf(0, 4, "Alt: %.1f m", g->alt);
-        } else {
+        } else if (e->motivo == GPS_REJ_SEM_FIX) {
             oled_text(0, 3, "Aguardando posicao...");
+        } else {
+            oled_text(0, 2, "Posicao rejeitada:");
+            oled_printf(0, 3, "  %s", gps_motivo_str(e->motivo));
         }
+        // Erro estimado arredondado para caber nas 21 colunas
+        char buf_e[8];
+        oled_printf(0, 5, "%s HDOP:%s e:%s", fix_str(g->fix), hdop,
+                    opcional(buf_e, sizeof(buf_e), "%.0fm", gps_erro_horizontal(g)));
         oled_printf(0, 6, "Satelites: %d", g->sats);
         if (lora_erro) {
             oled_text(0, 7, "LoRa: erro");
@@ -110,16 +162,53 @@ static void gps_print(const gps_data_t *g)
         oled_update();
     }
 
-    if (!g->valido) {
-        ESP_LOGW(TAG, "Aguardando posicao... (satelites: %d)", g->sats);
+    // Terminal: no maximo 1 linha por segundo, com a taxa medida (leituras/s)
+    static TickType_t ultimo_log;
+    static int leituras;
+    leituras++;
+    TickType_t agora = xTaskGetTickCount();
+    if (agora - ultimo_log < pdMS_TO_TICKS(1000)) {
+        return;
+    }
+    int taxa = leituras;
+    leituras = 0;
+    ultimo_log = agora;
+
+    if (e->motivo == GPS_REJ_SEM_FIX) {
+        ESP_LOGW(TAG, "Aguardando posicao... (satelites: %d) | %d Hz", g->sats, taxa);
+        return;
+    }
+    if (!aceito) {
+        ESP_LOGW(TAG, "Rejeitada (%s) | Fix: %s | Sats: %d | HDOP: %s | Erro: %s | %d Hz",
+                 gps_motivo_str(e->motivo), fix_str(g->fix), g->sats, hdop, erro, taxa);
         return;
     }
 
-    ESP_LOGI(TAG, "%02d/%02d/%04d %02d:%02d:%02d.%d | Lat: %.6f | Lon: %.6f | Alt: %.1f m",
+    ESP_LOGI(TAG, "%02d/%02d/%04d %02d:%02d:%02d.%d | Lat: %.6f | Lon: %.6f | Alt: %.1f m | "
+                  "Sats: %d | HDOP: %s | Erro: %s | %d Hz",
              t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
              t.tm_hour, t.tm_min, t.tm_sec, g->ms / 100,
-             g->lat, g->lon, g->alt);
+             g->lat, g->lon, g->alt, g->sats, hdop, erro, taxa);
 }
+
+#if SAIDA_CSV
+// Uma linha por epoca, aprovada ou nao, para reprocessar no PC
+static void gps_csv(const gps_estado_t *e)
+{
+    static bool cabecalho;
+    if (!cabecalho) {
+        printf("CSV,tick_ms,unix,ms,lat,lon,alt,vel_ms,curso,qualidade,fix,sats,"
+               "hdop,pdop,vdop,erro_lat,erro_lon,erro_alt,motivo\n");
+        cabecalho = true;
+    }
+    const gps_leitura_t *g = &e->l;
+    printf("CSV,%lu,%lld,%d,%.7f,%.7f,%.1f,%.2f,%.1f,%d,%d,%d,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%s\n",
+           (unsigned long)pdTICKS_TO_MS(e->tick), (long long)g->timestamp, g->ms,
+           g->lat, g->lon, g->alt, g->vel_ms, g->curso, g->qualidade, g->fix, g->sats,
+           g->hdop, g->pdop, g->vdop, g->erro_lat, g->erro_lon, g->erro_alt,
+           gps_motivo_str(e->motivo));
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Parser NMEA
@@ -164,6 +253,17 @@ static double nmea_coord(const char *valor, const char *hemi)
     return (hemi[0] == 'S' || hemi[0] == 'W') ? -d : d;
 }
 
+// Campo numerico opcional: vazio -> -1 (desconhecido)
+static float nmea_float(const char *s)
+{
+    return (*s) ? (float)atof(s) : -1.0f;
+}
+
+static int nmea_int(const char *s)
+{
+    return (*s) ? atoi(s) : 0;
+}
+
 // hhmmss.ss + ddmmyy -> Unix time (UTC)
 static time_t nmea_time(const char *hora, const char *data)
 {
@@ -180,6 +280,72 @@ static time_t nmea_time(const char *hora, const char *data)
     return mktime(&t);  // TZ do ESP32 e UTC por padrao
 }
 
+// Marca todos os campos como "nao recebido" no inicio de cada epoca, para
+// que uma sentenca perdida nao deixe valores da medicao anterior
+static void epoca_limpar(void)
+{
+    gps = (gps_leitura_t){
+        .vel_ms = -1, .curso = -1,
+        .hdop = -1, .pdop = -1, .vdop = -1,
+        .erro_lat = -1, .erro_lon = -1, .erro_alt = -1,
+    };
+}
+
+// Passa a epoca montada pela camada 1 e publica para as outras tasks
+static void epoca_publicar(void)
+{
+    gps_estado_t e = {
+        .l      = gps,
+        .motivo = gps_validar(&validador, &gps),
+        .tick   = xTaskGetTickCount(),
+    };
+
+    taskENTER_CRITICAL(&gps_lock);
+    gps_ultimo = e;
+    if (e.motivo == GPS_OK) {
+        gps_aceito = e;
+        gps_tem_aceito = true;
+    }
+    taskEXIT_CRITICAL(&gps_lock);
+
+    epoca_publicada = true;
+#if SAIDA_CSV
+    gps_csv(&e);
+#endif
+    gps_print(&e);
+}
+
+// Uma nova epoca comeca quando a hora muda ou quando chega de novo um tipo
+// de sentenca que ja foi recebido. A epoca anterior e publicada mesmo
+// incompleta (ex.: GST perdida) desde que tenha RMC ou GGA.
+static void epoca_sentenca(uint8_t sent, const char *hora)
+{
+    bool nova = (epoca_recebidas & sent) != 0;
+    if (hora && strcmp(hora, epoca_hora) != 0) {
+        nova = true;
+    }
+    if (nova) {
+        if (!epoca_publicada && (epoca_recebidas & (SENT_RMC | SENT_GGA))) {
+            epoca_publicar();
+        }
+        epoca_limpar();
+        epoca_recebidas = 0;
+        epoca_publicada = false;
+    }
+    if (hora) {
+        strlcpy(epoca_hora, hora, sizeof(epoca_hora));
+    }
+}
+
+// Chamada depois de interpretar a sentenca: publica assim que a epoca fica completa
+static void epoca_recebida(uint8_t sent)
+{
+    epoca_recebidas |= sent;
+    if (!epoca_publicada && (epoca_recebidas & epoca_esperadas) == epoca_esperadas) {
+        epoca_publicar();
+    }
+}
+
 static void nmea_parse(char *linha)
 {
     if (!nmea_checksum_ok(linha) || strlen(linha) < 6) {
@@ -190,29 +356,46 @@ static void nmea_parse(char *linha)
     int n = nmea_split(linha, f, 20);
     const char *tipo = f[0] + 3;  // ignora "$GP"/"$GN"
 
-    // $GPRMC,hora,status,lat,N/S,lon,E/W,vel,curso,data,...
+    // $GPRMC,hora,status,lat,N/S,lon,E/W,vel(nos),curso,data,...
     if (strcmp(tipo, "RMC") == 0 && n >= 10) {
-        gps.valido = (f[2][0] == 'A');
-        if (gps.valido) {
+        epoca_sentenca(SENT_RMC, f[1]);
+        gps.rmc_ativo = (f[2][0] == 'A');
+        if (gps.rmc_ativo) {
             gps.lat = nmea_coord(f[3], f[4]);
             gps.lon = nmea_coord(f[5], f[6]);
         }
+        float nos = nmea_float(f[7]);
+        gps.vel_ms = (nos >= 0) ? nos * 0.514444f : -1;
+        gps.curso = nmea_float(f[8]);
         gps.timestamp = nmea_time(f[1], f[9]);
         // fracao do segundo: "183535.20" -> 200 ms
         gps.ms = (strlen(f[1]) > 6) ? (int)(atof(f[1] + 6) * 1000 + 0.5) : 0;
+        epoca_recebida(SENT_RMC);
     }
     // $GPGGA,hora,lat,N/S,lon,E/W,qualidade,sats,hdop,alt,M,...
-    // GGA chega depois do RMC em cada ciclo: imprime aqui
     else if (strcmp(tipo, "GGA") == 0 && n >= 10) {
-        gps.sats = atoi(f[7]);
+        epoca_sentenca(SENT_GGA, f[1]);
+        gps.qualidade = nmea_int(f[6]);
+        gps.sats = nmea_int(f[7]);
+        gps.hdop = nmea_float(f[8]);
         gps.alt  = atof(f[9]);
-
-        // Publica a leitura completa para a lora_tx_task
-        taskENTER_CRITICAL(&gps_lock);
-        gps_ultimo = gps;
-        taskEXIT_CRITICAL(&gps_lock);
-
-        gps_print(&gps);
+        epoca_recebida(SENT_GGA);
+    }
+    // $GPGSA,modo,fix,sat1..sat12,pdop,hdop,vdop  (sem hora)
+    else if (strcmp(tipo, "GSA") == 0 && n >= 18) {
+        epoca_sentenca(SENT_GSA, NULL);
+        gps.fix  = nmea_int(f[2]);
+        gps.pdop = nmea_float(f[15]);
+        gps.vdop = nmea_float(f[17]);
+        epoca_recebida(SENT_GSA);
+    }
+    // $GPGST,hora,rms,semieixo_maior,semieixo_menor,orientacao,erro_lat,erro_lon,erro_alt
+    else if (strcmp(tipo, "GST") == 0 && n >= 9) {
+        epoca_sentenca(SENT_GST, f[1]);
+        gps.erro_lat = nmea_float(f[6]);
+        gps.erro_lon = nmea_float(f[7]);
+        gps.erro_alt = nmea_float(f[8]);
+        epoca_recebida(SENT_GST);
     }
 }
 
@@ -274,7 +457,9 @@ static bool ubx_cmd(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t le
 // Muda a velocidade, desliga sentencas nao usadas e ajusta a taxa de
 // atualizacao. A configuracao fica na RAM do GPS: ao perder a alimentacao
 // ele volta ao padrao (9600 baud, 1 Hz), por isso e refeita a cada boot.
-static bool gps_config(void)
+// Retorna a taxa aceita em Hz, ou 0 se o GPS nao respondeu em GPS_BAUD
+// (nesse caso ele continua em GPS_BAUD_PADRAO).
+static int gps_config(void)
 {
     // UBX-CFG-PRT: UART1 do GPS em GPS_BAUD, 8N1, entrada UBX+NMEA, saida UBX+NMEA
     const uint8_t cfg_prt[20] = {
@@ -298,23 +483,54 @@ static bool gps_config(void)
     uart_set_baudrate(GPS_UART, GPS_BAUD);
     uart_flush_input(GPS_UART);
 
-    // UBX-CFG-MSG: desliga GLL, GSA, GSV e VTG (so RMC e GGA sao usadas)
-    const uint8_t desligar[] = {0x01, 0x02, 0x03, 0x05};
-    for (size_t i = 0; i < sizeof(desligar); i++) {
-        const uint8_t cfg_msg[3] = {0xF0, desligar[i], 0x00};  // classe NMEA, id, taxa 0
-        if (!ubx_cmd(0x06, 0x01, cfg_msg, sizeof(cfg_msg))) {
-            return false;
+    // UBX-CFG-MSG: RMC e GGA ja vem ligadas de fabrica. Liga GSA (tipo de fix
+    // e DOP) e GST (erro estimado em metros), desliga GLL, GSV e VTG.
+    // Se o primeiro ACK chegar, o GPS esta mesmo em GPS_BAUD.
+    static const struct { uint8_t id; uint8_t taxa; uint8_t sent; const char *nome; } msgs[] = {
+        {0x01, 0, 0,        "GLL"},
+        {0x02, 1, SENT_GSA, "GSA"},
+        {0x03, 0, 0,        "GSV"},
+        {0x05, 0, 0,        "VTG"},
+        {0x07, 1, SENT_GST, "GST"},
+    };
+    for (size_t i = 0; i < sizeof(msgs) / sizeof(msgs[0]); i++) {
+        const uint8_t cfg_msg[3] = {0xF0, msgs[i].id, msgs[i].taxa};  // classe NMEA, id, taxa
+        if (ubx_cmd(0x06, 0x01, cfg_msg, sizeof(cfg_msg))) {
+            epoca_esperadas |= msgs[i].sent;
+        } else if (i == 0) {
+            return 0;
+        } else {
+            ESP_LOGW(TAG, "GPS nao aceitou configurar a sentenca %s", msgs[i].nome);
         }
     }
 
-    // UBX-CFG-RATE: intervalo entre medicoes em ms, 1 navegacao por medicao, hora GPS
-    const uint16_t periodo = 1000 / GPS_TAXA_HZ;
-    const uint8_t cfg_rate[6] = {
-        (uint8_t)(periodo & 0xFF), (uint8_t)(periodo >> 8),
-        0x01, 0x00,
-        0x01, 0x00,
-    };
-    return ubx_cmd(0x06, 0x08, cfg_rate, sizeof(cfg_rate));
+    // UBX-CFG-NAV5: modelo dinamico e fix somente 3D. Com 3 satelites o
+    // NEO-6M faz fix 2D supondo a altitude, e a posicao pode errar centenas
+    // de metros: assim ele passa a informar "sem fix" nesses casos.
+    uint8_t cfg_nav5[36] = {0};
+    cfg_nav5[0] = 0x05;                 // mascara: aplica dynModel (bit 0) e fixMode (bit 2)
+    cfg_nav5[2] = GPS_MODELO_DINAMICO;
+    cfg_nav5[3] = 2;                    // fixMode: 1 = so 2D, 2 = so 3D, 3 = automatico
+    if (!ubx_cmd(0x06, 0x24, cfg_nav5, sizeof(cfg_nav5))) {
+        ESP_LOGW(TAG, "GPS nao aceitou o CFG-NAV5 (modelo dinamico / fix 3D)");
+    }
+
+    // UBX-CFG-RATE: intervalo entre medicoes em ms, 1 navegacao por medicao, hora GPS.
+    // Alguns modulos (clones ou firmwares antigos) recusam taxas altas:
+    // tenta GPS_TAXA_HZ e vai descendo ate 1 Hz. O baud continua GPS_BAUD.
+    for (int taxa = GPS_TAXA_HZ; taxa > 1; taxa--) {
+        const uint16_t periodo = 1000 / taxa;
+        const uint8_t cfg_rate[6] = {
+            (uint8_t)(periodo & 0xFF), (uint8_t)(periodo >> 8),
+            0x01, 0x00,
+            0x01, 0x00,
+        };
+        if (ubx_cmd(0x06, 0x08, cfg_rate, sizeof(cfg_rate))) {
+            return taxa;
+        }
+        ESP_LOGW(TAG, "GPS recusou %d Hz, tentando uma taxa menor", taxa);
+    }
+    return 1;  // padrao de fabrica do GPS
 }
 
 // ---------------------------------------------------------------------------
@@ -378,134 +594,53 @@ static void lora_tx_task(void *arg)
     while (1) {
         xTaskDelayUntil(&ultimo_envio, pdMS_TO_TICKS(LORA_INTERVALO_MS));
 
-        gps_data_t g;
+        gps_estado_t ultimo, aceito;
+        bool tem_aceito;
         taskENTER_CRITICAL(&gps_lock);
-        g = gps_ultimo;
+        ultimo = gps_ultimo;
+        aceito = gps_aceito;
+        tem_aceito = gps_tem_aceito;
         taskEXIT_CRITICAL(&gps_lock);
 
+        // So transmite posicao aprovada pelo filtro e recente
+        const TickType_t agora = xTaskGetTickCount();
+        const TickType_t idade_max = pdMS_TO_TICKS(GPS_MAX_IDADE_MS);
+        const bool com_posicao = tem_aceito && (agora - aceito.tick) <= idade_max;
+
+        // Motivo exibido no log quando o pacote vai sem posicao
+        const char *estado = "com posicao";
+        if (!com_posicao) {
+            if (ultimo.tick == 0 || agora - ultimo.tick > idade_max) {
+                estado = "GPS sem dados";
+            } else if (ultimo.motivo != GPS_OK) {
+                estado = gps_motivo_str(ultimo.motivo);
+            } else {
+                estado = "leitura antiga";
+            }
+        }
+
+        const gps_leitura_t *g = com_posicao ? &aceito.l : &ultimo.l;
         pacote_t p = {
             .versao    = PACOTE_VERSAO,
-            .flags     = g.valido ? 0x01 : 0x00,
+            .flags     = com_posicao ? 0x01 : 0x00,
             .contador  = contador,
-            .timestamp = (uint32_t)g.timestamp,
-            .lat       = arredonda(g.lat * 1e7),
-            .lon       = arredonda(g.lon * 1e7),
-            .alt       = arredonda(g.alt * 10),
-            .sats      = (uint8_t)g.sats,
+            .timestamp = (uint32_t)g->timestamp,
+            .lat       = com_posicao ? arredonda(g->lat * 1e7) : 0,
+            .lon       = com_posicao ? arredonda(g->lon * 1e7) : 0,
+            .alt       = com_posicao ? arredonda(g->alt * 10) : 0,
+            .sats      = (uint8_t)g->sats,
         };
 
         esp_err_t err = lora_send((const uint8_t *)&p, sizeof(p));
         if (err == ESP_OK) {
             lora_ultimo_enviado = contador;
-            ESP_LOGI(TAG_LORA, "Pacote #%u enviado (%u bytes, %s)", contador,
-                     (unsigned)sizeof(p), g.valido ? "com posicao" : "sem posicao");
+            ESP_LOGI(TAG_LORA, "Pacote #%u enviado (%u bytes, %s%s)", contador, (unsigned)sizeof(p),
+                     com_posicao ? "" : "sem posicao: ", estado);
         } else {
             ESP_LOGW(TAG_LORA, "Falha ao enviar pacote #%u: %s", contador, esp_err_to_name(err));
         }
         contador++;
     }
-}
-
-// RECEPTOR: espera pacotes, decodifica e mostra
-static void lora_rx_task(void *arg)
-{
-    uint8_t buf[64];
-    int rssi = 0;
-    float snr = 0;
-    bool primeiro = true;
-    uint16_t esperado = 0;
-    uint32_t recebidos = 0, perdidos = 0;
-
-    lora_start_rx();
-
-    while (1) {
-        int n = lora_receive(buf, sizeof(buf), &rssi, &snr, 1000);
-        if (n == 0) {
-            continue;  // nada chegou ainda
-        }
-        if (n < 0) {
-            ESP_LOGW(TAG_LORA, "Pacote corrompido (erro de CRC)");
-            continue;
-        }
-
-        pacote_t p;
-        if (n != sizeof(p)) {
-            ESP_LOGW(TAG_LORA, "Pacote desconhecido (%d bytes)", n);
-            continue;
-        }
-        memcpy(&p, buf, sizeof(p));
-        if (p.versao != PACOTE_VERSAO) {
-            ESP_LOGW(TAG_LORA, "Versao de pacote desconhecida: %u", p.versao);
-            continue;
-        }
-
-        // Pacotes perdidos: saltos no contador
-        if (!primeiro && p.contador != esperado) {
-            perdidos += (uint16_t)(p.contador - esperado);
-        }
-        primeiro = false;
-        esperado = p.contador + 1;
-        recebidos++;
-
-        double lat = p.lat / 1e7;
-        double lon = p.lon / 1e7;
-        double alt = p.alt / 10.0;
-        time_t local = (time_t)p.timestamp + FUSO_HORARIO * 3600;
-        struct tm t;
-        gmtime_r(&local, &t);
-
-        if (p.flags & 0x01) {
-            ESP_LOGI(TAG_LORA, "#%u | %02d/%02d/%04d %02d:%02d:%02d | Lat: %.6f | Lon: %.6f | "
-                               "Alt: %.1f m | Sats: %u | RSSI: %d dBm | SNR: %.1f dB | Perdidos: %lu",
-                     p.contador, t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
-                     t.tm_hour, t.tm_min, t.tm_sec, lat, lon, alt, p.sats,
-                     rssi, snr, (unsigned long)perdidos);
-        } else {
-            ESP_LOGW(TAG_LORA, "#%u | transmissor sem posicao (sats: %u) | RSSI: %d dBm | SNR: %.1f dB",
-                     p.contador, p.sats, rssi, snr);
-        }
-
-        if (oled_ok) {
-            oled_clear();
-            oled_printf(0, 0, "RX #%u  Perd: %lu", p.contador, (unsigned long)perdidos);
-            oled_hline(1);
-            if (p.flags & 0x01) {
-                oled_printf(0, 2, "Lat: %.6f", lat);
-                oled_printf(0, 3, "Lon: %.6f", lon);
-                oled_printf(0, 4, "Alt: %.1f m", alt);
-                oled_printf(0, 5, "%02d/%02d %02d:%02d:%02d S:%u",
-                            t.tm_mday, t.tm_mon + 1, t.tm_hour, t.tm_min, t.tm_sec, p.sats);
-            } else {
-                oled_text(0, 3, "TX sem posicao");
-            }
-            oled_printf(0, 7, "RSSI:%d SNR:%.1f", rssi, snr);
-            oled_update();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-
-static void iniciar_receptor(void)
-{
-    esp_err_t err = lora_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_LORA, "Falha ao iniciar o radio: %s", esp_err_to_name(err));
-        if (oled_ok) {
-            oled_text(0, 7, "LoRa: erro");
-            oled_update();
-        }
-        return;
-    }
-    ESP_LOGI(TAG_LORA, "Receptor pronto: %.1f MHz, SF%d", LORA_FREQ_HZ / 1e6, LORA_SF);
-    if (oled_ok) {
-        oled_clear();
-        oled_text(0, 0, "Receptor LoRa");
-        oled_hline(1);
-        oled_text(0, 3, "Aguardando pacotes...");
-        oled_update();
-    }
-    xTaskCreate(lora_rx_task, "lora_rx_task", 4096, NULL, 5, NULL);
 }
 
 void app_main(void)
@@ -515,16 +650,11 @@ void app_main(void)
     esp_err_t err = oled_init();
     oled_ok = (err == ESP_OK);
     if (oled_ok) {
-        oled_text(0, 0, MODO_RECEPTOR ? "Receptor LoRa" : "GPS NEO-6M");
+        oled_text(0, 0, "GPS NEO-6M");
         oled_text(0, 3, "Iniciando...");
         oled_update();
     } else {
         ESP_LOGE(TAG, "Falha ao iniciar o display: %s", esp_err_to_name(err));
-    }
-
-    if (MODO_RECEPTOR) {
-        iniciar_receptor();
-        return;
     }
 
     const uart_config_t cfg = {
@@ -541,9 +671,10 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_set_pin(GPS_UART, GPS_TX_PIN, GPS_RX_PIN,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    if (gps_config()) {
+    int taxa = gps_config();
+    if (taxa > 0) {
         ESP_LOGI(TAG, "GPS configurado: UART%d (RX=%d, TX=%d), %d baud, %d Hz",
-                 GPS_UART, GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD, GPS_TAXA_HZ);
+                 GPS_UART, GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD, taxa);
     } else {
         // Sem resposta (ex.: fio GPIO5 -> RX do GPS desligado): volta ao padrao
         uart_set_baudrate(GPS_UART, GPS_BAUD_PADRAO);
@@ -552,7 +683,9 @@ void app_main(void)
                  GPS_TX_PIN, GPS_BAUD_PADRAO);
     }
 
-    xTaskCreate(gps_task, "gps_task", 4096, NULL, 5, NULL);
+    gps_validador_init(&validador);
+    epoca_limpar();
+    xTaskCreate(gps_task, "gps_task", 6144, NULL, 5, NULL);  // printf de float usa bastante pilha
 
     err = lora_init();
     if (err == ESP_OK) {

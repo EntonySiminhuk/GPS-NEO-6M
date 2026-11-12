@@ -18,7 +18,6 @@
 // Comandos do SX1262 (datasheet, cap. 13)
 #define CMD_SET_STANDBY         0x80
 #define CMD_SET_TX              0x83
-#define CMD_SET_RX              0x82
 #define CMD_SET_PACKET_TYPE     0x8A
 #define CMD_SET_RF_FREQUENCY    0x86
 #define CMD_SET_TX_PARAMS       0x8E
@@ -29,10 +28,7 @@
 #define CMD_SET_DIO_IRQ         0x08
 #define CMD_GET_IRQ_STATUS      0x12
 #define CMD_CLEAR_IRQ           0x02
-#define CMD_GET_RX_BUFFER       0x13
-#define CMD_GET_PACKET_STATUS   0x14
 #define CMD_WRITE_BUFFER        0x0E
-#define CMD_READ_BUFFER         0x1E
 #define CMD_WRITE_REGISTER      0x0D
 #define CMD_READ_REGISTER       0x1D
 #define CMD_CALIBRATE           0x89
@@ -44,9 +40,6 @@
 
 // Bits de interrupcao
 #define IRQ_TX_DONE     (1 << 0)
-#define IRQ_RX_DONE     (1 << 1)
-#define IRQ_HEADER_ERR  (1 << 5)
-#define IRQ_CRC_ERR     (1 << 6)
 #define IRQ_TIMEOUT     (1 << 9)
 
 #define REG_SYNC_WORD_MSB   0x0740
@@ -250,8 +243,8 @@ esp_err_t lora_init(void)
 
     CHECK(set_packet_params(255));
 
-    // Interrupcoes usadas, todas sinalizadas no DIO1
-    const uint16_t mask = IRQ_TX_DONE | IRQ_RX_DONE | IRQ_HEADER_ERR | IRQ_CRC_ERR | IRQ_TIMEOUT;
+    // Interrupcoes usadas (fim do envio), sinalizadas no DIO1
+    const uint16_t mask = IRQ_TX_DONE | IRQ_TIMEOUT;
     const uint8_t irq[] = {mask >> 8, mask & 0xFF, mask >> 8, mask & 0xFF, 0, 0, 0, 0};
     CHECK(cmd(CMD_SET_DIO_IRQ, irq, sizeof(irq)));
 
@@ -289,59 +282,4 @@ esp_err_t lora_send(const uint8_t *data, size_t len)
     }
     set_standby();
     return ESP_ERR_TIMEOUT;
-}
-
-esp_err_t lora_start_rx(void)
-{
-    CHECK(set_standby());
-    CHECK(set_packet_params(255));
-    CHECK(clear_irq());
-    const uint8_t continuo[] = {0xFF, 0xFF, 0xFF};  // recepcao continua
-    return cmd(CMD_SET_RX, continuo, sizeof(continuo));
-}
-
-int lora_receive(uint8_t *buf, size_t max, int *rssi, float *snr, uint32_t timeout_ms)
-{
-    uint16_t irq = 0;
-    for (uint32_t t = 0; t < timeout_ms; t += 10) {
-        if (get_irq(&irq) != ESP_OK) {
-            return -1;
-        }
-        if (irq & (IRQ_RX_DONE | IRQ_CRC_ERR | IRQ_HEADER_ERR)) {
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    if (!(irq & (IRQ_RX_DONE | IRQ_CRC_ERR | IRQ_HEADER_ERR))) {
-        return 0;
-    }
-    if (irq & (IRQ_CRC_ERR | IRQ_HEADER_ERR)) {
-        clear_irq();
-        return -1;
-    }
-
-    // Tamanho e posicao do pacote no buffer do radio
-    uint8_t st[2];
-    if (cmd_read(CMD_GET_RX_BUFFER, st, 2) != ESP_OK) {
-        return -1;
-    }
-    size_t len = st[0] < max ? st[0] : max;
-
-    memset(tx_buf, 0, len + 3);
-    tx_buf[0] = CMD_READ_BUFFER;
-    tx_buf[1] = st[1];  // offset
-    if (xfer(len + 3) != ESP_OK) {
-        return -1;
-    }
-    memcpy(buf, &rx_buf[3], len);
-
-    // Qualidade do sinal
-    uint8_t ps[3];
-    if (cmd_read(CMD_GET_PACKET_STATUS, ps, 3) == ESP_OK) {
-        *rssi = -ps[0] / 2;
-        *snr = (int8_t)ps[1] / 4.0f;
-    }
-
-    clear_irq();
-    return (int)len;
 }
